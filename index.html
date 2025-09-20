@@ -1,20 +1,157 @@
-<!DOCTYPE html>
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>قارئ QR يعمل فوراً</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background:#0b1320; color:#e9eefb }
+    .wrap { max-width: 720px; margin: 0 auto; display: grid; gap: 12px }
+    video, canvas { width: 100%; max-height: 60vh; background: #000; border-radius: 16px }
+    .row { display: grid; gap: 8px }
+    .btn { padding: 10px 14px; border: 0; border-radius: 12px; cursor: pointer; font-weight: 600 }
+    .primary { background: #4f7cff; color: #fff }
+    .muted { opacity: .8 }
+    .result { background: #111a33; padding: 12px 14px; border-radius: 12px; word-break: break-word; direction: ltr }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#1e2b52; font-size:12px; margin-inline-start:6px }
+    .error { color:#ff9b9b }
+    .hint  { font-size: 12px; color: #b9c5ea }
+  </style>
 
-<html>
-<head>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
-  <title>Spoon-Knife</title>
-  <LINK href="styles.css" rel="stylesheet" type="text/css">
-</head>
+  <body>
+    <div class="wrap">
+      <h1>قارئ QR مباشر</h1>
+      <div class="row">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="canvas" hidden></canvas>
+        <div class="hint">السماح للكاميرا ضروري. ضع الكود داخل الإطار أمام الكاميرا.</div>
+      </div>
 
-<body>
+      <div class="row">
+        <button class="btn primary" id="startBtn">تشغيل الكاميرا</button>
+        <button class="btn" id="stopBtn">إيقاف</button>
+        <span id="status" class="muted">جاهز</span>
+      </div>
 
-<img src="forkit.gif" id="octocat" alt="" />
+      <div class="row">
+        <div>النتيجة <span class="badge" id="formatBadge" hidden></span></div>
+        <div id="result" class="result">—</div>
+        <div id="error" class="error"></div>
+      </div>
+    </div>
 
-<!-- Feel free to change this text here -->
-<p>
-  Fork me? Fork you, @octocat!
-</p>
+    <script>
+      // غيّر المسار هنا ليطابق اسم الملف الذي رفعتَه:
+      const WORKER_URL = "qr-worker.js"; // ← لو اسم ملفك مختلف، عدّله
 
-</body>
+      const video   = document.getElementById('video');
+      const canvas  = document.getElementById('canvas');
+      const ctx     = canvas.getContext('2d', { willReadFrequently: true });
+      const startBtn= document.getElementById('startBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const status  = document.getElementById('status');
+      const resultEl= document.getElementById('result');
+      const errorEl = document.getElementById('error');
+      const formatBadge = document.getElementById('formatBadge');
+
+      let stream = null;
+      let rafId  = null;
+      let worker = null;
+      let reqId  = 0;
+      let busy   = false;
+      let stopped= false;
+
+      // تفعيل BarcodeDetector الأصلي إن توفّر (أسرع)، وإلا نستعمل الـ worker الذي أرفقته
+      const hasNative = 'BarcodeDetector' in window;
+      const detector = hasNative ? new window.BarcodeDetector({ formats: ['qr_code'] }) : null;
+
+      async function startCamera() {
+        try {
+          stopped = false;
+          stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+          video.srcObject = stream;
+          await video.play();
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+
+          if (!hasNative) {
+            worker = new Worker(WORKER_URL);
+            worker.onmessage = (ev) => {
+              const { id, detectedBarcodes } = ev.data || {};
+              if (id !== reqId) return;
+              busy = false;
+              if (detectedBarcodes && detectedBarcodes.length > 0) {
+                const hit = detectedBarcodes[0];
+                showResult(hit.rawValue, hit.format || 'qr_code');
+                stopCamera(); // أوقف بعد القراءة الأولى — يمكنك إزالة هذا السطر لو أردت المسح المستمر
+              } else {
+                tick(); // استمر بالمحاولة
+              }
+            };
+          }
+
+          status.textContent = hasNative ? 'يستخدم BarcodeDetector الأصلي' : 'يستخدم Worker JS الذي رفعته';
+          scanLoop();
+        } catch (e) {
+          showError('تعذّر فتح الكاميرا: ' + (e.message || e));
+        }
+      }
+
+      function stopCamera() {
+        stopped = true;
+        if (rafId) cancelAnimationFrame(rafId), rafId = null;
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+        if (worker) { worker.terminate(); worker = null; }
+        status.textContent = 'متوقّف';
+      }
+
+      function showResult(text, fmt='qr_code') {
+        resultEl.textContent = text || '—';
+        formatBadge.textContent = fmt;
+        formatBadge.hidden = !fmt;
+        errorEl.textContent = '';
+      }
+
+      function showError(msg) {
+        errorEl.textContent = msg || '';
+      }
+
+      async function scanFrame() {
+        if (!video.videoWidth || !video.videoHeight) return;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        if (hasNative) {
+          try {
+            const barcodes = await detector.detect(imageData);
+            if (barcodes.length) {
+              showResult(barcodes[0].rawValue, barcodes[0].format || 'qr_code');
+              stopCamera();
+              return;
+            }
+          } catch (e) {
+            // إن فشل الأصلي لأي سبب سنسقط تلقائياً إلى worker (لو متاح)
+          }
+        }
+
+        if (!hasNative && worker && !busy) {
+          busy = true;
+          reqId++;
+          // البروتوكول الذي يبنيه ملفك: نرسل { id, imageData } ويرد { id, detectedBarcodes }
+          worker.postMessage({ id: reqId, imageData }, [imageData.data.buffer]);
+        }
+      }
+
+      function tick() {
+        if (stopped) return;
+        rafId = requestAnimationFrame(scanLoop);
+      }
+
+      function scanLoop() {
+        scanFrame().finally(tick);
+      }
+
+      startBtn.addEventListener('click', startCamera);
+      stopBtn .addEventListener('click', stopCamera);
+    </script>
+  </body>
 </html>
